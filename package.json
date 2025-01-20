@@ -3,15 +3,18 @@
   "version": "1.0.0",
   "description": "CloudPaste - A secure file sharing service",
   "main": "src/index.js",
+  "type": "module",
   "scripts": {
     "build": "echo 'No build step required'",
     "deploy": "wrangler deploy",
-    "dev": "wrangler dev"
+    "dev": "wrangler dev --local & node scripts/init-db.js",
+    "start": "wrangler dev --local"
   },
   "dependencies": {
     "hono": "^3.12.0"
   },
   "devDependencies": {
-    "wrangler": "^3.0.0"
+    "wrangler": "^3.0.0",
+    "node-fetch": "^3.3.0"
   }
 }

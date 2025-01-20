@@ -19,10 +19,10 @@ vars = { ENVIRONMENT = "production" }
 [env.development]
 vars = { ENVIRONMENT = "development" }
 
-[[kv_namespaces]]
-binding = "CLOUDPASTE_KV"
-id = "placeholder-id"
-preview_id = "placeholder-id"
+[[d1_databases]]
+binding = "DB"
+database_name = "cloudpaste-dev"
+database_id = "ccb779fd-fa11-4a3d-8ea3-04b93b39854a"
 
 [[r2_buckets]]
 binding = "CLOUDPASTE_BUCKET"
