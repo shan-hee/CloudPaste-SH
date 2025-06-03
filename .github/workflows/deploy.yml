@@ -10,33 +10,25 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '21.x'
           cache: 'npm'
-      
+
       - name: Install Dependencies
+        run: npm ci
+
+      - name: Verify Cloudflare Authentication
         run: |
-          npm ci
-          npm install -g wrangler
-      
-      - name: Configure Wrangler
-        run: |
-          mkdir -p ~/.wrangler
-          
-          cat > ~/.wrangler/config.toml << EOF
-          api_token = "${{ secrets.CF_API_TOKEN }}"
-          account_id = "${{ secrets.CF_ACCOUNT_ID }}"
-          EOF
-          
-          wrangler whoami
+          echo "Testing Cloudflare API connection..."
+          npx wrangler whoami
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
       
       - name: Cache Wrangler
         uses: actions/cache@v4
@@ -48,161 +40,95 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-wrangler-
       
-      - name: Check and Create KV Namespace
+      - name: Setup KV Namespace
         run: |
-          wrangler telemetry disable
-          
-          function create_kv_namespace() {
-            local namespace=$1
-            local namespace_title="$namespace"
-            echo "Processing KV namespace: $namespace_title"
-            
-            echo "Listing KV namespaces..."
-            LIST_OUTPUT=$(wrangler kv:namespace list)
-            echo "KV namespaces list output: $LIST_OUTPUT"
-            
-            # 首先尝试精确匹配
-            KV_ID=$(echo "$LIST_OUTPUT" | jq -r --arg title "$namespace_title" '.[] | select(.title == $title) | .id')
-            
-            # 如果没找到，尝试匹配带前缀的命名空间
-            if [ -z "$KV_ID" ]; then
-                KV_ID=$(echo "$LIST_OUTPUT" | jq -r --arg title "$namespace_title" '.[] | select(.title | endswith($title)) | .id')
+          echo "Setting up KV namespace..."
+
+          # 尝试创建命名空间，如果已存在会返回现有的ID
+          NAMESPACE_OUTPUT=$(npx wrangler kv namespace create "PASTE_STORE" 2>&1)
+          echo "Namespace creation output: $NAMESPACE_OUTPUT"
+
+          # 从输出中提取ID (支持多种格式)
+          PASTE_STORE_ID=""
+
+          # 方法1: 从标准输出格式提取
+          if [[ $NAMESPACE_OUTPUT =~ id\ =\ \"([^\"]+)\" ]]; then
+            PASTE_STORE_ID="${BASH_REMATCH[1]}"
+          fi
+
+          # 方法2: 从错误信息中提取已存在的ID
+          if [ -z "$PASTE_STORE_ID" ] && [[ $NAMESPACE_OUTPUT =~ already\ exists.*id:\ ([a-f0-9]{32}) ]]; then
+            PASTE_STORE_ID="${BASH_REMATCH[1]}"
+          fi
+
+          # 方法3: 如果创建失败，尝试列出现有的命名空间
+          if [ -z "$PASTE_STORE_ID" ]; then
+            echo "Trying to find existing namespace..."
+            LIST_OUTPUT=$(npx wrangler kv namespace list 2>/dev/null || echo "")
+            if [ ! -z "$LIST_OUTPUT" ]; then
+              # 尝试从列表中找到匹配的命名空间
+              PASTE_STORE_ID=$(echo "$LIST_OUTPUT" | grep -i "paste" | head -1 | grep -o '[a-f0-9]\{32\}' | head -1)
             fi
-            
-            if [ ! -z "$KV_ID" ]; then
-                echo "Found existing KV namespace with ID: $KV_ID"
-            else
-                echo "Creating KV namespace: $namespace_title"
-                CREATE_OUTPUT=$(wrangler kv:namespace create "$namespace_title")
-                echo "Create output: $CREATE_OUTPUT"
-                
-                # 从创建输出中提取 ID
-                KV_ID=$(echo "$CREATE_OUTPUT" | grep -o 'id = "[^"]*"' | cut -d'"' -f2)
-                if [ -z "$KV_ID" ]; then
-                    # 尝试从 JSON 输出中提取
-                    KV_ID=$(echo "$CREATE_OUTPUT" | jq -r '.id // empty')
-                fi
-                echo "Created KV namespace with ID: $KV_ID"
-            fi
-            
-            if [ -z "$KV_ID" ]; then
-                echo "Failed to get KV namespace ID"
-                exit 1
-            fi
-            
-            # 验证 ID 格式
-            if ! [[ $KV_ID =~ ^[0-9a-f]{32}$ ]]; then
-                echo "Invalid KV namespace ID format: $KV_ID"
-                exit 1
-            fi
-            
-            echo "${namespace}_ID=$KV_ID" >> $GITHUB_ENV
-            echo "Set environment variable ${namespace}_ID=$KV_ID"
-          }
-          
-          create_kv_namespace "PASTE_STORE"
-          create_kv_namespace "UPLOAD_STATUS"
-          
-          # 验证环境变量
-          echo "Verifying environment variables:"
-          echo "PASTE_STORE_ID: $PASTE_STORE_ID"
-          echo "UPLOAD_STATUS_ID: $UPLOAD_STATUS_ID"
+          fi
+
+          if [ -z "$PASTE_STORE_ID" ]; then
+            echo "Error: Could not create or find KV namespace"
+            echo "Output was: $NAMESPACE_OUTPUT"
+            exit 1
+          fi
+
+          echo "PASTE_STORE_ID=$PASTE_STORE_ID" >> $GITHUB_ENV
+          echo "Using KV namespace ID: $PASTE_STORE_ID"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
       
       - name: Check and Create R2 Bucket
         run: |
           R2_BUCKET="cloudpaste-files"
           echo "Checking R2 bucket: $R2_BUCKET"
-          
-          BUCKET_LIST=$(wrangler r2 bucket list || echo "")
-          if [ $? -ne 0 ]; then
-            echo "Failed to list R2 buckets"
-            exit 1
-          fi
-          
-          if ! echo "$BUCKET_LIST" | grep -q "$R2_BUCKET"; then
-            echo "Creating R2 bucket: $R2_BUCKET"
-            if ! wrangler r2 bucket create "$R2_BUCKET" --location apac; then
-              echo "Failed to create R2 bucket"
-              exit 1
-            fi
-            echo "R2 bucket created successfully"
-          else
+
+          # 检查bucket是否存在
+          if npx wrangler r2 bucket list | grep -q "$R2_BUCKET"; then
             echo "R2 bucket already exists"
+          else
+            echo "Creating R2 bucket: $R2_BUCKET"
+            npx wrangler r2 bucket create "$R2_BUCKET" --location apac
+            echo "R2 bucket created successfully"
           fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
 
       - name: Update wrangler.toml
         run: |
-          if [ -z "$PASTE_STORE_ID" ] || [ -z "$UPLOAD_STATUS_ID" ]; then
-            echo "Error: KV namespace IDs are not set"
+          if [ -z "$PASTE_STORE_ID" ]; then
+            echo "Error: PASTE_STORE_ID is not set"
             exit 1
           fi
-          
+
           echo "PASTE_STORE_ID: $PASTE_STORE_ID"
-          echo "UPLOAD_STATUS_ID: $UPLOAD_STATUS_ID"
-          
-          # Escape the variables
-          PASTE_STORE_ID_ESC=$(echo "$PASTE_STORE_ID" | sed 's/[\/&]/\\&/g')
-          
-          # Create temporary file with placeholder
-          cat > wrangler.toml.tmp << 'EOF'
-          name = "cloudpaste"
-          main = "src/index.js"
-          compatibility_date = "2024-01-09"
-          
-          [vars]
-          # 通过环境变量覆盖这些默认值
-          ENVIRONMENT = "development"  # development/production
-          TOTAL_STORAGE_GB = "6"      # 总存储容量，单位GB
-          ADMIN_USERNAME = "admin"     # 管理员用户名
-          ADMIN_PASSWORD = "admin"     # 管理员密码，生产环境建议通过环境变量设置
-          MAX_FILE_SIZE = "500"       # 单个文件大小限制，单位MB
-          SESSION_DURATION = "7d"      # 会话持续时间
-          TEXT_UPLOAD_ENABLED = "true" # 文本上传开关
-          FILE_UPLOAD_ENABLED = "true" # 文件上传开关
-          
-          [env.production]
-          vars = { ENVIRONMENT = "production" }
-          
-          [env.development]
-          vars = { ENVIRONMENT = "development" }
-          
-          [[kv_namespaces]]
-          binding = "CLOUDPASTE_KV"
-          id = "PASTE_STORE_ID_PLACEHOLDER"
-          preview_id = "PASTE_STORE_ID_PLACEHOLDER"
-          
-          [[r2_buckets]]
-          binding = "CLOUDPASTE_BUCKET"
-          bucket_name = "cloudpaste-files"
-          preview_bucket_name = "cloudpaste-files-dev"
-          
-          [site]
-          bucket = "./public"
-          
-          [build]
-          command = "npm run build"    # Pages 构建命令
-          
-          [triggers]
-          crons = ["0 0 * * *"]       # 定时清理任务
-          EOF
-          
-          # Replace placeholder with actual value
-          sed -i "s/PASTE_STORE_ID_PLACEHOLDER/$PASTE_STORE_ID_ESC/g" wrangler.toml.tmp
-          
-          # Replace the original file
-          mv wrangler.toml.tmp wrangler.toml
-          
+
+          # 更新 wrangler.toml 中的 KV namespace ID
+          sed -i "s/placeholder-id/$PASTE_STORE_ID/g" wrangler.toml
+
           echo "Updated wrangler.toml configuration:"
           cat wrangler.toml
       
-      - name: Deploy to Cloudflare Workers
-        uses: cloudflare/wrangler-action@2.0.0
-        with:
-          apiToken: ${{ secrets.CF_API_TOKEN }}
-          preCommands: |
-            npm install
+      - name: Build Project
+        run: |
+          if [ -f "package.json" ] && grep -q '"build"' package.json; then
             npm run build
-          command: deploy --var ADMIN_USERNAME:${{ secrets.ADMIN_USERNAME }} --var ADMIN_PASSWORD:${{ secrets.ADMIN_PASSWORD }}
+          else
+            echo "No build script found, skipping build step"
+          fi
+
+      - name: Deploy to Cloudflare Workers
+        run: |
+          npx wrangler deploy \
+            --var ADMIN_USERNAME:"${{ secrets.ADMIN_USERNAME || 'admin' }}" \
+            --var ADMIN_PASSWORD:"${{ secrets.ADMIN_PASSWORD || 'admin' }}" \
+            --var ENVIRONMENT:"production"
         env:
-          ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME }}
-          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
