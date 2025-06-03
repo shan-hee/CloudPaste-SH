@@ -211,8 +211,8 @@ app.post('/api/text', async (c) => {
       return permissionCheck;
     }
 
-    // 生成唯一ID
-    const id = crypto.randomUUID()
+    // 生成4位数简单ID
+    const id = await generateSimpleId(c)
     
     // 计算过期时间
     let expiresAt = null
@@ -304,8 +304,8 @@ app.post('/api/file', async (c) => {
             return permissionCheck;
         }
 
-        // 生成唯一ID
-        const id = customUrl || crypto.randomUUID();
+        // 生成4位数简单ID
+        const id = customUrl || await generateSimpleId(c);
         
         // 计算过期时间
         let expiresAt = null;
@@ -327,9 +327,39 @@ app.post('/api/file', async (c) => {
 
         // 上传文件到 R2
         const arrayBuffer = await file.arrayBuffer();
+
+        // 验证文件大小
+        if (arrayBuffer.byteLength !== file.size) {
+            console.error('文件大小不匹配:', {
+                expected: file.size,
+                actual: arrayBuffer.byteLength
+            });
+            return c.json({
+                success: false,
+                message: '文件上传过程中出现错误，请重试'
+            }, 400);
+        }
+
+        // 确定正确的 MIME 类型
+        const detectedMimeType = getMimeTypeFromFilename(file.name) || file.type || 'application/octet-stream';
+
+        console.log('上传文件信息:', {
+            id,
+            filename: file.name,
+            originalname: originalname || file.name,
+            size: file.size,
+            mimeType: detectedMimeType,
+            arrayBufferSize: arrayBuffer.byteLength
+        });
+
         await c.env.CLOUDPASTE_BUCKET.put(id, arrayBuffer, {
             httpMetadata: {
-                contentType: file.type
+                contentType: detectedMimeType,
+                contentLength: file.size.toString()
+            },
+            customMetadata: {
+                originalFilename: originalname || file.name,
+                uploadTime: Date.now().toString()
             }
         });
 
@@ -340,14 +370,15 @@ app.post('/api/file', async (c) => {
             filename: file.name,
             originalname: originalname || file.name,  // 使用传入的原始文件名或默认为文件名
             filesize: file.size,
-            mimetype: file.type,
+            mimetype: detectedMimeType,  // 使用检测到的MIME类型
             password,
             maxViews: maxViews ? parseInt(maxViews) : 0,
             views: 0,
             created: Date.now(),
             createdAt: Date.now(),  // 添加 createdAt 字段
             expiresAt,
-            isManualUpload: true  // 添加手动上传标记
+            isManualUpload: true,  // 添加手动上传标记
+            uploadChecksum: arrayBuffer.byteLength  // 添加文件大小校验
         };
 
         // 存储元数据到 KV
@@ -660,7 +691,7 @@ app.get('/s/:id', async (c) => {
 app.get('/s/:id/download', async (c) => {
     try {
         const id = c.req.param('id');
-        
+
         // 从 KV 中获取分享数据
         const shareData = await c.env.CLOUDPASTE_KV.get(id, 'json');
         if (!shareData || shareData.type !== 'file') {
@@ -678,6 +709,25 @@ app.get('/s/:id/download', async (c) => {
             }, 410);
         }
 
+        // 检查是否需要密码
+        if (shareData.password) {
+            const accessToken = c.req.header('X-Access-Token');
+            if (!accessToken || shareData.password !== accessToken) {
+                return c.json({
+                    success: false,
+                    message: '需要密码访问或密码错误'
+                }, 403);
+            }
+        }
+
+        // 检查访问次数
+        if (shareData.maxViews > 0 && shareData.views >= shareData.maxViews) {
+            return c.json({
+                success: false,
+                message: '文件已达到最大访问次数'
+            }, 410);
+        }
+
         // 从 R2 获取文件
         const file = await c.env.CLOUDPASTE_BUCKET.get(id);
         if (!file) {
@@ -687,13 +737,62 @@ app.get('/s/:id/download', async (c) => {
             }, 404);
         }
 
-        // 设置响应头
+        // 验证文件完整性
+        if (shareData.uploadChecksum && file.size !== shareData.uploadChecksum) {
+            console.error('文件完整性验证失败:', {
+                expected: shareData.uploadChecksum,
+                actual: file.size,
+                id
+            });
+            return c.json({
+                success: false,
+                message: '文件已损坏，无法下载'
+            }, 500);
+        }
+
+        // 更新访问次数
+        shareData.views = (shareData.views || 0) + 1;
+        await c.env.CLOUDPASTE_KV.put(id, JSON.stringify(shareData), {
+            expirationTtl: shareData.expiresAt ? Math.ceil((shareData.expiresAt - Date.now()) / 1000) : undefined
+        });
+
+        // 获取文件的原始文件名，确保正确的文件扩展名
+        const originalFilename = shareData.originalname || shareData.filename;
+        const safeFilename = originalFilename.replace(/[^\w\s.-]/g, '_'); // 清理文件名中的特殊字符
+
+        // 设置正确的响应头
         const headers = new Headers();
-        headers.set('Content-Type', shareData.mimetype || 'application/octet-stream');
-        headers.set('Content-Disposition', `attachment; filename="${encodeURIComponent(shareData.originalname || shareData.filename)}"`);
+
+        // 根据文件扩展名设置正确的 MIME 类型
+        const mimeType = getMimeTypeFromFilename(originalFilename) || shareData.mimetype || 'application/octet-stream';
+        headers.set('Content-Type', mimeType);
+
+        // 设置文件下载头，使用 RFC 5987 编码来支持非ASCII字符
+        const encodedFilename = encodeURIComponent(safeFilename);
+        headers.set('Content-Disposition', `attachment; filename*=UTF-8''${encodedFilename}; filename="${safeFilename}"`);
+
+        // 设置文件大小
+        if (shareData.filesize) {
+            headers.set('Content-Length', shareData.filesize.toString());
+        }
+
+        // 设置缓存控制
+        headers.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+        headers.set('Pragma', 'no-cache');
+        headers.set('Expires', '0');
+
+        console.log('文件下载:', {
+            id,
+            filename: originalFilename,
+            mimeType,
+            size: shareData.filesize
+        });
 
         // 返回文件内容
-        return new Response(file.body, { headers });
+        return new Response(file.body, {
+            headers,
+            status: 200
+        });
     } catch (error) {
         console.error('下载文件失败:', error);
         return c.json({
@@ -702,6 +801,7 @@ app.get('/s/:id/download', async (c) => {
         }, 500);
     }
 });
+
 
 // 验证分享密码
 app.post('/s/:id/verify', async (c) => {
@@ -918,6 +1018,98 @@ app.post('/api/admin/settings', async (c) => {
   }
 });
 
+// 生成4位数简单ID
+async function generateSimpleId(c) {
+    let attempts = 0;
+    const maxAttempts = 100; // 防止无限循环
+
+    while (attempts < maxAttempts) {
+        // 生成4位数字ID (1000-9999)
+        const id = Math.floor(Math.random() * 9000) + 1000;
+        const idStr = id.toString();
+
+        // 检查ID是否已存在
+        const existing = await c.env.CLOUDPASTE_KV.get(idStr);
+        if (!existing) {
+            return idStr;
+        }
+
+        attempts++;
+    }
+
+    // 如果尝试100次都没有找到可用ID，回退到UUID
+    console.warn('无法生成唯一的4位数ID，回退到UUID');
+    return crypto.randomUUID();
+}
+
+// 根据文件名获取MIME类型
+function getMimeTypeFromFilename(filename) {
+    if (!filename) return null;
+
+    const ext = filename.toLowerCase().split('.').pop();
+    const mimeTypes = {
+        // 图片
+        'jpg': 'image/jpeg',
+        'jpeg': 'image/jpeg',
+        'png': 'image/png',
+        'gif': 'image/gif',
+        'bmp': 'image/bmp',
+        'webp': 'image/webp',
+        'svg': 'image/svg+xml',
+        'ico': 'image/x-icon',
+
+        // 文档
+        'pdf': 'application/pdf',
+        'doc': 'application/msword',
+        'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'xls': 'application/vnd.ms-excel',
+        'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'ppt': 'application/vnd.ms-powerpoint',
+        'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        'txt': 'text/plain',
+        'rtf': 'application/rtf',
+
+        // 压缩文件
+        'zip': 'application/zip',
+        'rar': 'application/x-rar-compressed',
+        '7z': 'application/x-7z-compressed',
+        'tar': 'application/x-tar',
+        'gz': 'application/gzip',
+
+        // 音频
+        'mp3': 'audio/mpeg',
+        'wav': 'audio/wav',
+        'flac': 'audio/flac',
+        'aac': 'audio/aac',
+        'ogg': 'audio/ogg',
+
+        // 视频
+        'mp4': 'video/mp4',
+        'avi': 'video/x-msvideo',
+        'mov': 'video/quicktime',
+        'wmv': 'video/x-ms-wmv',
+        'flv': 'video/x-flv',
+        'webm': 'video/webm',
+
+        // 代码文件
+        'html': 'text/html',
+        'css': 'text/css',
+        'js': 'application/javascript',
+        'json': 'application/json',
+        'xml': 'application/xml',
+        'csv': 'text/csv',
+
+        // 可执行文件
+        'exe': 'application/vnd.microsoft.portable-executable',
+        'msi': 'application/x-msi',
+        'dmg': 'application/x-apple-diskimage',
+        'deb': 'application/vnd.debian.binary-package',
+        'rpm': 'application/x-rpm'
+    };
+
+    return mimeTypes[ext] || null;
+}
+
 // 验证上传权限
 async function checkUploadPermission(c, type) {
   try {
@@ -926,21 +1118,21 @@ async function checkUploadPermission(c, type) {
       textUploadEnabled: c.env.TEXT_UPLOAD_ENABLED === 'true',
       fileUploadEnabled: c.env.FILE_UPLOAD_ENABLED === 'true'
     };
-    
+
     if (type === 'text' && !settings.textUploadEnabled) {
       return c.json({
         success: false,
         message: '文本上传功能已关闭'
       }, 403);
     }
-    
+
     if (type === 'file' && !settings.fileUploadEnabled) {
       return c.json({
         success: false,
         message: '文件上传功能已关闭'
       }, 403);
     }
-    
+
     return true;
   } catch (error) {
     console.error('验证上传权限失败:', error);

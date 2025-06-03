@@ -1240,7 +1240,7 @@ function createShareItem(share) {
     const icon = isFile ? getFileIconByName(share.originalname || share.filename || share.id) : 'fa-file-alt';
     const expirationTime = share.expiration ? new Date(share.expiration).toLocaleString() : '永不过期';
     const createdTime = share.createdAt ? new Date(share.createdAt).toLocaleString() : '未知时间';
-    const displayId = (share.id || '').split('-')[0];
+    const displayId = share.id || '';
 
     return `
         <div class="share-item" data-id="${share.id}" data-type="${share.type}">

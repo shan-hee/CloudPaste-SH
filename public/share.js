@@ -475,12 +475,43 @@ function getFileIcon(mimeType) {
     return fileIconMap.default;
 }
 
+// 显示内容容器并隐藏加载状态
+function showContent() {
+    const loadingContainer = document.getElementById('loadingContainer');
+    const contentContainer = document.getElementById('contentContainer');
+
+    if (loadingContainer) {
+        loadingContainer.style.display = 'none';
+    }
+    if (contentContainer) {
+        contentContainer.style.display = 'block';
+    }
+}
+
+// 显示错误状态
+function showError(message) {
+    const loadingContainer = document.getElementById('loadingContainer');
+    if (loadingContainer) {
+        loadingContainer.innerHTML = `
+            <div class="loading-spinner">
+                <i class="fas fa-exclamation-triangle" style="color: #ff6b6b;"></i>
+            </div>
+            <div class="loading-text" style="color: #ff6b6b;">${message}</div>
+            <div style="margin-top: 20px;">
+                <button onclick="window.location.reload()" style="padding: 8px 16px; border: 1px solid #ff6b6b; background: transparent; color: #ff6b6b; border-radius: 4px; cursor: pointer;">
+                    重新加载
+                </button>
+            </div>
+        `;
+    }
+}
+
 // 加载分享内容
 async function loadShareContent() {
     try {
         const urlParams = new URLSearchParams(window.location.search);
         const shareId = urlParams.get('id');
-        
+
         if (!shareId) {
             showToast('无效的分享链接', 3000);
             return;
@@ -601,12 +632,15 @@ async function loadShareContent() {
             if (qrButton) {
                 qrButton.dataset.url = window.location.href;
             }
+
+            // 显示内容，隐藏加载状态
+            showContent();
         } else {
-            showToast(data.message || '加载分享内容失败', 3000);
+            showError(data.message || '加载分享内容失败');
         }
     } catch (error) {
         console.error('加载分享内容失败:', error);
-        showToast('加载分享内容失败', 3000);
+        showError('加载分享内容失败');
     }
 }
 
